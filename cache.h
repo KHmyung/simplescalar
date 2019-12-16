@@ -149,7 +149,7 @@ struct cache_set_t
 };
 
 struct cache_mshr_t{
-  int used;
+  int status;
   md_addr_t addr; 
   tick_t ready;
 };

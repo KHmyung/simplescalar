@@ -58,6 +58,10 @@
 #include "machine.h"
 #include "cache.h"
 
+
+#define MSHR_USED 1
+#define MSHR_UNUSED 0
+#define IS_MSHR_HIT(cp, addr1, addr2)	(CACHE_TAGSET(cp, addr) == addr2)
 /* cache access macros */
 #define CACHE_TAG(cp, addr)	((addr) >> (cp)->tag_shift)
 #define CACHE_SET(cp, addr)	(((addr) >> (cp)->set_shift) & (cp)->set_mask)
@@ -294,114 +298,132 @@ cache_create(char *name,		/* name of the cache */
 		fatal("cache associativity `%d' must be a power of two", assoc);
 	if (!blk_access_fn)
 		fatal("must specify miss/replacement functions");
-	if (mshr > 0)
+
+	/* allocate the cache structure */
+	cp = (struct cache_t *)
+		calloc(1, sizeof(struct cache_t) + (nsets-1)*sizeof(struct cache_set_t));
+	if (!cp)
+		fatal("out of virtual memory");
+	
+	if (mshr > 0){
+		cp->mshr = mshr;
 		printf("mshr is enabled(%s : %d)\n", name, mshr);
-	else printf("mshr is disabled(%s)\n", name);
+	}
+	else {
+		cp->mshr = 0;
+		printf("mshr is disabled(%s)\n", name);
+	}
 
-			/* allocate the cache structure */
-			cp = (struct cache_t *)
-			calloc(1, sizeof(struct cache_t) + (nsets-1)*sizeof(struct cache_set_t));
-			if (!cp)
-			fatal("out of virtual memory");
+	/* initialize user parameters */
+	cp->name = mystrdup(name);
+	cp->nsets = nsets;
+	cp->bsize = bsize;
+	cp->balloc = balloc;
+	cp->usize = usize;
+	cp->assoc = assoc;
+	cp->policy = policy;
+	cp->hit_latency = hit_latency;
 
-			/* initialize user parameters */
-			cp->name = mystrdup(name);
-			cp->nsets = nsets;
-			cp->bsize = bsize;
-			cp->balloc = balloc;
-			cp->usize = usize;
-			cp->assoc = assoc;
-			cp->policy = policy;
-			cp->hit_latency = hit_latency;
+	/* miss/replacement functions */
+	cp->blk_access_fn = blk_access_fn;
 
-			/* miss/replacement functions */
-			cp->blk_access_fn = blk_access_fn;
+	/* compute derived parameters */
+	cp->hsize = CACHE_HIGHLY_ASSOC(cp) ? (assoc >> 2) : 0;
+	cp->blk_mask = bsize-1;
+	cp->set_shift = log_base2(bsize);
+	cp->set_mask = nsets-1;
+	cp->tag_shift = cp->set_shift + log_base2(nsets);
+	cp->tag_mask = (1 << (32 - cp->tag_shift))-1;
+	cp->tagset_mask = ~cp->blk_mask;
+	cp->bus_free = 0;
 
-			/* compute derived parameters */
-			cp->hsize = CACHE_HIGHLY_ASSOC(cp) ? (assoc >> 2) : 0;
-			cp->blk_mask = bsize-1;
-			cp->set_shift = log_base2(bsize);
-			cp->set_mask = nsets-1;
-			cp->tag_shift = cp->set_shift + log_base2(nsets);
-			cp->tag_mask = (1 << (32 - cp->tag_shift))-1;
-			cp->tagset_mask = ~cp->blk_mask;
-			cp->bus_free = 0;
+	/* print derived parameters during debug */
+	debug("%s: cp->hsize     = %d", cp->name, cp->hsize);
+	debug("%s: cp->blk_mask  = 0x%08x", cp->name, cp->blk_mask);
+	debug("%s: cp->set_shift = %d", cp->name, cp->set_shift);
+	debug("%s: cp->set_mask  = 0x%08x", cp->name, cp->set_mask);
+	debug("%s: cp->tag_shift = %d", cp->name, cp->tag_shift);
+	debug("%s: cp->tag_mask  = 0x%08x", cp->name, cp->tag_mask);
 
-			/* print derived parameters during debug */
-			debug("%s: cp->hsize     = %d", cp->name, cp->hsize);
-			debug("%s: cp->blk_mask  = 0x%08x", cp->name, cp->blk_mask);
-			debug("%s: cp->set_shift = %d", cp->name, cp->set_shift);
-			debug("%s: cp->set_mask  = 0x%08x", cp->name, cp->set_mask);
-			debug("%s: cp->tag_shift = %d", cp->name, cp->tag_shift);
-			debug("%s: cp->tag_mask  = 0x%08x", cp->name, cp->tag_mask);
+	cp->mshr = mshr;
+	/* initialize MSHR */
+	if(cp->mshr){
+		cp->mshr_desc = (struct cache_mshr_t *)calloc(1, sizeof(struct cache_mshr_t)*cp->mshr);
+		cp->mshr_outstanding = 0;
+		cp->mshr_hits = 0;
+		cp->mshr_misses = 0;
+	}
+	else{
+		cp->mshr_desc = NULL;
+	}
 
-			/* initialize cache stats */
-			cp->hits = 0;
-			cp->misses = 0;
-			cp->replacements = 0;
-			cp->writebacks = 0;
-			cp->invalidations = 0;
+	/* initialize cache stats */
+	cp->hits = 0;
+	cp->misses = 0;
+	cp->replacements = 0;
+	cp->writebacks = 0;
+	cp->invalidations = 0;
 
-			/* blow away the last block accessed */
-			cp->last_tagset = 0;
-			cp->last_blk = NULL;
+	/* blow away the last block accessed */
+	cp->last_tagset = 0;
+	cp->last_blk = NULL;
 
-			/* allocate data blocks */
-			cp->data = (byte_t *)calloc(nsets * assoc,
-					sizeof(struct cache_blk_t) +
-					(cp->balloc ? (bsize*sizeof(byte_t)) : 0));
-			if (!cp->data)
+	/* allocate data blocks */
+	cp->data = (byte_t *)calloc(nsets * assoc,
+			sizeof(struct cache_blk_t) +
+			(cp->balloc ? (bsize*sizeof(byte_t)) : 0));
+	if (!cp->data)
+		fatal("out of virtual memory");
+
+	/* slice up the data blocks */
+	for (bindex=0,i=0; i<nsets; i++)
+	{
+		cp->sets[i].way_head = NULL;
+		cp->sets[i].way_tail = NULL;
+		/* get a hash table, if needed */
+		if (cp->hsize)
+		{
+			cp->sets[i].hash =
+				(struct cache_blk_t **)calloc(cp->hsize,
+						sizeof(struct cache_blk_t *));
+			if (!cp->sets[i].hash)
 				fatal("out of virtual memory");
+		}
+		/* NOTE: all the blocks in a set *must* be allocated contiguously,
+		   otherwise, block accesses through SET->BLKS will fail (used
+		   during random replacement selection) */
+		cp->sets[i].blks = CACHE_BINDEX(cp, cp->data, bindex);
 
-			/* slice up the data blocks */
-			for (bindex=0,i=0; i<nsets; i++)
-			{
-				cp->sets[i].way_head = NULL;
-				cp->sets[i].way_tail = NULL;
-				/* get a hash table, if needed */
-				if (cp->hsize)
-				{
-					cp->sets[i].hash =
-						(struct cache_blk_t **)calloc(cp->hsize,
-								sizeof(struct cache_blk_t *));
-					if (!cp->sets[i].hash)
-						fatal("out of virtual memory");
-				}
-				/* NOTE: all the blocks in a set *must* be allocated contiguously,
-				   otherwise, block accesses through SET->BLKS will fail (used
-				   during random replacement selection) */
-				cp->sets[i].blks = CACHE_BINDEX(cp, cp->data, bindex);
+		/* link the data blocks into ordered way chain and hash table bucket
+		   chains, if hash table exists */
+		for (j=0; j<assoc; j++)
+		{
+			/* locate next cache block */
+			blk = CACHE_BINDEX(cp, cp->data, bindex);
+			bindex++;
 
-				/* link the data blocks into ordered way chain and hash table bucket
-				   chains, if hash table exists */
-				for (j=0; j<assoc; j++)
-				{
-					/* locate next cache block */
-					blk = CACHE_BINDEX(cp, cp->data, bindex);
-					bindex++;
+			/* invalidate new cache block */
+			blk->status = 0;
+			blk->tag = 0;
+			blk->ready = 0;
+			blk->user_data = (usize != 0
+					? (byte_t *)calloc(usize, sizeof(byte_t)) : NULL);
 
-					/* invalidate new cache block */
-					blk->status = 0;
-					blk->tag = 0;
-					blk->ready = 0;
-					blk->user_data = (usize != 0
-							? (byte_t *)calloc(usize, sizeof(byte_t)) : NULL);
+			/* insert cache block into set hash table */
+			if (cp->hsize)
+				link_htab_ent(cp, &cp->sets[i], blk);
 
-					/* insert cache block into set hash table */
-					if (cp->hsize)
-						link_htab_ent(cp, &cp->sets[i], blk);
-
-					/* insert into head of way list, order is arbitrary at this point */
-					blk->way_next = cp->sets[i].way_head;
-					blk->way_prev = NULL;
-					if (cp->sets[i].way_head)
-						cp->sets[i].way_head->way_prev = blk;
-					cp->sets[i].way_head = blk;
-					if (!cp->sets[i].way_tail)
-						cp->sets[i].way_tail = blk;
-				}
-			}
-			return cp;
+			/* insert into head of way list, order is arbitrary at this point */
+			blk->way_next = cp->sets[i].way_head;
+			blk->way_prev = NULL;
+			if (cp->sets[i].way_head)
+				cp->sets[i].way_head->way_prev = blk;
+			cp->sets[i].way_head = blk;
+			if (!cp->sets[i].way_tail)
+				cp->sets[i].way_tail = blk;
+		}
+	}
+	return cp;
 }
 
 /* parse policy */
@@ -474,6 +496,15 @@ cache_reg_stats(struct cache_t *cp,	/* cache instance */
 	sprintf(buf, "%s.inv_rate", name);
 	sprintf(buf1, "%s.invalidations / %s.accesses", name, name);
 	stat_reg_formula(sdb, buf, "invalidation rate (i.e., invs/ref)", buf1, NULL);
+	if (cp->mshr){
+		sprintf(buf, "%s.mshr_accesses", name);
+		sprintf(buf1, "%s.mshr_hits + %s.mshr_misses", name, name);
+		stat_reg_formula(sdb, buf, "total number of mshr accesses", buf1, "%12.0f");
+		sprintf(buf, "%s.mshr_hits", name);
+		stat_reg_counter(sdb, buf, "total number of mshr hits", &cp->mshr_hits, 0, NULL);
+		sprintf(buf, "%s.mshr_misses", name);
+		stat_reg_counter(sdb, buf, "total number of mshr misses", &cp->mshr_misses, 0, NULL);
+	}
 }
 
 /* print cache stats */
@@ -515,10 +546,11 @@ cache_access(struct cache_t *cp,	/* cache to access */
 	md_addr_t bofs = CACHE_BLK(cp, addr);
 	struct cache_blk_t *blk, *repl;
 	int lat = 0;
-
+	int mshr_id = -1;
 	/* default replacement address */
 	if (repl_addr)
 		*repl_addr = 0;
+
 
 	/* check alignments */
 	//  if ((nbytes & (nbytes-1)) != 0 || (addr & (nbytes-1)) != 0)
@@ -531,6 +563,25 @@ cache_access(struct cache_t *cp,	/* cache to access */
 	//    fatal("cache: access error: access spans block, addr 0x%08x", addr);
 
 	/* permissions are checked on cache misses */
+
+	if (cp->mshr){
+		for (int i = 0; i < cp ->mshr; i++){	// MSHR status update
+			if((cp->mshr_desc[i].ready < now) && (cp->mshr_desc[i].status == MSHR_USED)){
+				cp->mshr_desc[i].status = MSHR_UNUSED;
+				cp->mshr_outstanding--;
+			}
+		}
+	
+	/* MSHR hit handling */
+		for (int i = 0; i < cp->mshr; i++){
+			if(IS_MSHR_HIT(cp, addr, cp->mshr_desc[i].addr) &&
+				(cp->mshr_desc[i].status == MSHR_USED) ){
+				cp->mshr_hits++;
+				return cp->mshr_desc[i].ready;
+			}
+		}
+	}
+
 
 	/* check for a fast hit: access to same block */
 	if (IS_CACHE_FAST_HIT(cp, addr) && (cp->last_blk != NULL))
@@ -569,6 +620,23 @@ cache_access(struct cache_t *cp,	/* cache to access */
 
 	/* **MISS** */
 	cp->misses++;
+
+	/* MSHR miss handling */
+	if (cp->mshr){
+		cp->mshr_misses++;
+		if(cp->mshr_outstanding < cp->mshr){
+			for(int i = 0; i < cp->mshr; i++){
+				if(cp->mshr_desc[i].status == MSHR_UNUSED){	// mshr entry is reserved
+					mshr_id = i;
+					cp->mshr_desc[i].addr = CACHE_TAGSET(cp, addr);
+					cp->mshr_desc[i].status = MSHR_USED;
+					break;	
+				}
+			}
+		}
+		else return -1;
+	}
+
 
 	/* select the appropriate block to replace, and re-link this entry to
 	   the appropriate place in the way list */
@@ -647,6 +715,10 @@ cache_access(struct cache_t *cp,	/* cache to access */
 
 	/* update block status */
 	repl->ready = now+lat;
+
+	if (cp->mshr){
+		cp->mshr_desc[mshr_id].ready = repl->ready;
+	}
 
 	/* link this entry back into the hash table */
 	if (cp->hsize)
