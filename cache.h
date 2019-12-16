@@ -148,6 +148,12 @@ struct cache_set_t
 				   access to cache blocks */
 };
 
+struct cache_mshr_t{
+  int used;
+  md_addr_t addr; 
+  tick_t ready;
+};
+
 /* cache definition */
 struct cache_t
 {
@@ -158,6 +164,9 @@ struct cache_t
   int balloc;			/* maintain cache contents? */
   int usize;			/* user allocated data size */
   int assoc;			/* cache associativity */
+  int mshr;			/* # of mshr */
+  int mshr_outstanding;
+  struct cache_mshr_t *mshr_desc;
   enum cache_policy policy;	/* cache replacement policy */
   unsigned int hit_latency;	/* cache hit latency */
 
@@ -203,6 +212,8 @@ struct cache_t
   counter_t writebacks;		/* total number of writebacks at misses */
   counter_t invalidations;	/* total number of external invalidations */
 
+  counter_t mshr_hits;		/* total number of hits */
+  counter_t mshr_misses;	/* total number of misses */
   /* last block to hit, used to optimize cache hit processing */
   md_addr_t last_tagset;	/* tag of last line accessed */
   struct cache_blk_t *last_blk;	/* cache block last accessed */
@@ -223,6 +234,7 @@ cache_create(char *name,		/* name of the cache */
 	     int balloc,		/* allocate data space for blocks? */
 	     int usize,			/* size of user data to alloc w/blks */
 	     int assoc,			/* associativity of cache */
+		int mshr,
 	     enum cache_policy policy,	/* replacement policy w/in sets */
 	     /* block access function, see description w/in struct cache def */
 	     unsigned int (*blk_access_fn)(enum mem_cmd cmd,
